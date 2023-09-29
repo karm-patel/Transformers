@@ -7,8 +7,13 @@ import copy
 from models.layers import *
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout):
+    def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, 
+                 max_seq_length, dropout, src_pad_token_val, tar_pad_token_val, device=torch.device("cuda")):
         super(Transformer, self).__init__()
+        self.src_pad_token_val = src_pad_token_val
+        self.tar_pad_token_val = tar_pad_token_val
+        self.device = device
+
         self.encoder_embedding = nn.Embedding(src_vocab_size, d_model)
         self.decoder_embedding = nn.Embedding(tgt_vocab_size, d_model)
         self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
@@ -20,11 +25,11 @@ class Transformer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def generate_mask(self, src, tgt):
-        src_mask = (src != 0).unsqueeze(1).unsqueeze(2) # (B, 1, 1, n, d_model)
-        tgt_mask = (tgt != 0).unsqueeze(1).unsqueeze(3)
+        src_mask = (src != self.src_pad_token_val).unsqueeze(1).unsqueeze(2) # (B, 1, 1, n, d_model)
+        tgt_mask = (tgt != self.tar_pad_token_val).unsqueeze(1).unsqueeze(3)
         seq_length = tgt.size(1)
         # generate lower-triangular matrix, upper-values will be 1e-9 in masking layers
-        nopeak_mask = (1 - torch.triu(torch.ones(1, seq_length, seq_length), diagonal=1)).bool() 
+        nopeak_mask = (1 - torch.triu(torch.ones(1, seq_length, seq_length), diagonal=1)).bool().to(self.device)
         tgt_mask = tgt_mask & nopeak_mask
         return src_mask, tgt_mask
 
