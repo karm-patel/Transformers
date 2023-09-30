@@ -10,12 +10,13 @@ from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
 import os
 from dataloader.dataloader import NMTDataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from models.transformer import Transformer
 from torchsummary import torchsummary
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torchmetrics import ExactMatch, Accuracy
+
 
 device = torch.device("cuda")
 cpu_device = torch.device("cpu")
@@ -23,14 +24,31 @@ cpu_device = torch.device("cpu")
 # %reload_ext autoreload
 # %autoreload 2
 
-n_train = 36000
-train_dataset = load_dataset('cfilt/iitb-english-hindi', split=f"train[:{n_train}]")
-print(len(train_dataset))
+n_train = 40000
+
+raw_dataset = load_dataset('cfilt/iitb-english-hindi', split=f"train[:{n_train}]")
+print(len(raw_dataset))
+
+# determine max length
+val_ds_size = 4000
+d_model = 512
+drop_prob = 0.1
+n_h = 8
+d_ff = 2048
+d_k = d_model/n_h
+n_layers = 6
+seq_len = 130
+B = 256
+lr = 1e-4
+n_epochs = 10
+
+train_ds_size = n_train - val_ds_size
+train_dataset, val_dataset = random_split(raw_dataset, [train_ds_size, val_ds_size], generator=torch.Generator().manual_seed(42))
 
 test_dataset = load_dataset('cfilt/iitb-english-hindi', split="test")
 print(len(test_dataset))
 
-val_dataset = load_dataset('cfilt/iitb-english-hindi', split="validation")
+# val_dataset = load_dataset('cfilt/iitb-english-hindi', split="validation")
 print(len(val_dataset))
 
 train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=len(train_dataset))
@@ -58,34 +76,24 @@ for lang in ["hi", "en"]:
 
 tokenizer_src = Tokenizer.from_file(f"dataset/vocab_en_{n_train}.json")
 tokenizer_tar = Tokenizer.from_file(f"dataset/vocab_hi_{n_train}.json")
-tokenizer_tar
 
-train_ds = NMTDataset(tokenizer_src, tokenizer_tar, train_dataloader)
-val_ds = NMTDataset(tokenizer_src, tokenizer_tar, val_dataloader)
+train_ds = NMTDataset(tokenizer_src, tokenizer_tar, train_dataloader, max_length=seq_len)
+val_ds = NMTDataset(tokenizer_src, tokenizer_tar, val_dataloader, max_length=seq_len)
 print(len(train_ds), len(val_ds))
 
-B = 512
 train_dl = DataLoader(train_ds, batch_size=B, shuffle=True)
-val_dl = DataLoader(val_ds, batch_size=len(val_ds), shuffle=True)
+val_dl = DataLoader(val_ds, batch_size=B, shuffle=True)
 
-seq_len = 100
-d_model = 512
-drop_prob = 0.1
-n_h = 8
-d_ff = 2048
-d_k = d_model/n_h
-n_layers = 6
 
-transformer = Transformer(tokenizer_src.get_vocab_size(), tokenizer_tar.get_vocab_size(), d_model, n_h, n_layers , d_ff, seq_len, drop_prob, tokenizer_src.token_to_id("<pad>"), tokenizer_tar.token_to_id("<pad>")).to(device)
+transformer = Transformer(tokenizer_src.get_vocab_size(), tokenizer_tar.get_vocab_size(), 
+                          d_model, n_h, n_layers , d_ff, seq_len, drop_prob, 
+                          tokenizer_src.token_to_id("<pad>"), tokenizer_tar.token_to_id("<pad>")).to(device)
 
 # torchsummary.summary(transformer, [(1, 100), (1, 100)], device="cpu")
 
 ### Train loop
 
-import torch.nn.functional as F
-import torch.nn as nn
 
-lr = 1e-4
 optim = torch.optim.Adam(transformer.parameters(),lr=lr)
 loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('<pad>'))
 EM = ExactMatch(task="multiclass", num_classes=tokenizer_tar.get_vocab_size(), 
@@ -93,7 +101,6 @@ EM = ExactMatch(task="multiclass", num_classes=tokenizer_tar.get_vocab_size(),
 Acc = Accuracy(task="multiclass", num_classes=tokenizer_tar.get_vocab_size(), 
                 ignore_index=tokenizer_tar.token_to_id("<pad>")).to(device)
 
-n_epochs = 30
 
 train_losses, val_losses = [], []
 val_ems, val_accs = [], []
@@ -116,18 +123,27 @@ for i in range(n_epochs):
     with torch.no_grad():
         transformer.eval()
         src, tar = next(iter(val_dl))
-        src, tar = src.to(device), tar.to(device)
-        val_logits = transformer(src, tar)
-        val_y_pred = torch.argmax(val_logits, dim=-1)
-        val_loss = loss_fn(val_logits.permute(0,2,1), tar)
-        val_losses.append(val_loss.detach().to(cpu_device))
-        
-        val_acc, val_em = Acc(val_y_pred, tar).to(cpu_device), EM(val_y_pred, tar).to(cpu_device)
+        val_y_preds, val_target = [], []
+        for src, tar in val_dl:
+            src, tar = src.to(device), tar.to(device)
+            val_logits = transformer(src, tar)
+            val_y_pred = torch.argmax(val_logits, dim=-1)
+            val_loss = loss_fn(val_logits.permute(0,2,1), tar)
+
+            val_y_preds.append(val_y_pred)
+            val_target.append(tar)
+            val_losses.append(val_loss.detach().to(cpu_device))
+
+        val_y_preds = torch.cat(val_y_preds)
+        val_y_target = torch.cat(val_target)
+        tar = val_ds.tar_tokens
+        val_acc, val_em = Acc(val_y_preds, val_y_target).to(cpu_device), EM(val_y_preds, val_y_target).to(cpu_device)
         val_accs.append(val_acc)
         val_ems.append(val_em)
+
         if val_loss < prev_loss:
             print("Saving Model -", end=" ")
-            torch.save(transformer.state_dict(), f"ckpts/test_transformer_{n_train}_{lr}")            
+            torch.save(transformer.state_dict(), f"ckpts/transformer_{n_train}_{lr}_{n_epochs}")            
         prev_loss = val_loss
         
     print(f"Val loss: {val_loss.detach().to(cpu_device)} Val acc {val_acc} Val EM {val_em}") 
